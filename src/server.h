@@ -128,7 +128,9 @@ typedef struct
 
 	entity_state_t static_entities[MAX_STATIC_ENTITIES];
 	int            static_entity_count;
-#ifdef FTE_PEXT_CSQC
+#if defined(MVD_PEXT1_SIMPLEPROJECTILE) || defined(FTE_PEXT_CSQC)
+	sprojectile_state_t simple_projectiles[MAX_EDICTS];
+	unsigned short	csqcsendstates[MAX_EDICTS];
 	unsigned int	csqcchecksum;
 #endif
 } server_t;
@@ -185,6 +187,22 @@ typedef struct
 
 #ifdef MVD_PEXT1_SERVERSIDEWEAPON
 #define MAX_WEAPONSWITCH_OPTIONS    10
+#endif
+
+#if defined(MVD_PEXT1_SIMPLEPROJECTILE) || defined(FTE_PEXT_CSQC)
+#define SCOPE_WANTREMOVE 1
+#define SCOPE_WANTUPDATE 2
+#define SCOPE_WANTSEND (SCOPE_WANTREMOVE | SCOPE_WANTUPDATE)
+#define SCOPE_EXISTED_ONCE 4
+#define SCOPE_ASSUMED_EXISTING 8
+#define NUM_CSQCENTITIES_PER_FRAME 256
+typedef struct csqcentityframedb_s
+{
+	int framenum;
+	int num;
+	unsigned short entno[NUM_CSQCENTITIES_PER_FRAME];
+	int sendflags[NUM_CSQCENTITIES_PER_FRAME];
+} csqcentityframedb_t;
 #endif
 
 typedef struct client_s
@@ -348,10 +366,6 @@ typedef struct client_s
 	} voice_target;
 #endif
 
-#ifdef FTE_PEXT_CSQC
-	qbool			csqcactive;
-#endif
-
 	//===== NETWORK ============
 	qbool           process_pext;             // true if we wait for reply from client on "cmd pext" command.
 	int             chokecount;
@@ -372,6 +386,22 @@ typedef struct client_s
 	int             lastteleport_outgoingseq; // outgoing sequence# when the player teleported
 	int             lastteleport_incomingseq; // incoming sequence# when the player teleported
 	float           lastteleport_teleportyaw; // new yaw angle, post-teleport
+#endif
+
+#if defined(MVD_PEXT1_SIMPLEPROJECTILE) || defined(FTE_PEXT_CSQC)
+	// CSQC stuff, we don't have full CSQC yet but they are used for simpleprojectiles
+	int csqcactive;
+	int ezcsqc_ready;
+	int csqc_framenum;
+	int csqc_latestverified;
+	int csqcnumedicts;
+	unsigned char csqcentityscope[MAX_EDICTS];
+	unsigned int csqcentitysendflags[MAX_EDICTS];
+
+	#define NUM_CSQCENTITYDB_FRAMES		UPDATE_MASK//256
+	csqcentityframedb_t csqcentityframehistory[NUM_CSQCENTITYDB_FRAMES];
+	int csqcentityframehistory_next;
+	int csqcentityframe_lastreset;
 #endif
 
 #ifdef MVD_PEXT1_SERVERSIDEWEAPON
@@ -398,6 +428,15 @@ typedef struct client_s
 		float    last_sidemove;     // Previous frame's sidemove value
 	} safestrafe;
 } client_t;
+
+static inline qbool SV_ClientSupportsEZCSQC(const client_t *client)
+{
+#if defined(FTE_PEXT_CSQC) && defined(MVD_PEXT1_EZCSQC)
+	return client->csqcactive && (client->mvdprotocolextensions1 & MVD_PEXT1_EZCSQC);
+#else
+	return false;
+#endif
+}
 
 // a client can leave the server in one of four ways:
 // dropping properly by quiting or disconnecting

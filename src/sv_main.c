@@ -438,6 +438,7 @@ void SV_DropClient(client_t* drop)
 
 #ifdef FTE_PEXT_CSQC
 	drop->csqcactive = false;
+	drop->ezcsqc_ready = false;
 #endif
 
 	Info_RemoveAll(&drop->_userinfo_ctx_);
@@ -1387,7 +1388,7 @@ static void SVC_DirectConnect (void)
 #endif // PROTOCOL_VERSION_FTE2
 
 #ifdef PROTOCOL_VERSION_MVD1
-	newcl->mvdprotocolextensions1 = mvdext_supported1;
+	newcl->mvdprotocolextensions1 = mvdext_supported1 & svs.mvdprotocolextension1;
 #endif
 
 	newcl->_userinfo_ctx_.max      = MAX_CLIENT_INFOS;
@@ -3426,6 +3427,7 @@ void SV_InitLocal (void)
 	static cvar_t qwm_platform = { "qwm_platform", "" };
 	static cvar_t qwm_builddate = { "qwm_builddate", "" };
 	static cvar_t qwm_homepage = { "qwm_homepage", "" };
+	static cvar_t qwm_ezcsqc = { "qwm_ezcsqc", "" };
 
 	packet_t *packet_freeblock; // initialise delayed packet free block
 
@@ -3603,6 +3605,7 @@ void SV_InitLocal (void)
 	Cvar_Register(&qwm_platform);
 	Cvar_Register(&qwm_builddate);
 	Cvar_Register(&qwm_homepage);
+	Cvar_Register(&qwm_ezcsqc);
 
 	Cvar_Register(&sv_mod_extensions);
 

@@ -25,6 +25,9 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 static void SV_ClientDownloadComplete(client_t* cl);
 
+#if defined(MVD_PEXT1_SIMPLEPROJECTILE) || defined(FTE_PEXT_CSQC)
+extern void EntityFrameCSQC_LostFrame(client_t *client, int framenum, int latest_received_framenum);
+#endif
 edict_t	*sv_player;
 
 usercmd_t	cmd;
@@ -391,6 +394,20 @@ static void Cmd_New_f (void)
 	}
 #endif
 
+#ifdef FTE_PEXT_CSQC
+	if (sv_client->fteprotocolextensions & FTE_PEXT_CSQC) {
+#ifdef MVD_PEXT1_EZCSQC
+		if (sv_client->mvdprotocolextensions1 & MVD_PEXT1_EZCSQC) {
+		//	SV_ClientPrintf(sv_client, 2, "\n\n&c0faEZCSQC ANTILAG PENDING SETUP...&r\n");
+		}
+		else
+#endif
+		{
+			SV_ClientPrintf(sv_client, 2, "\n\nENABLING CSQC FOR YOU!\nYOU'RE WELCOME\n");
+		}
+		sv_client->csqcactive = true;
+	}
+#endif
 	//NOTE:  This doesn't go through ClientReliableWrite since it's before the user
 	//spawns.  These functions are written to not overflow
 	if (sv_client->num_backbuf)
@@ -995,6 +1012,29 @@ static void Cmd_Begin_f (void)
 		pr_global_struct->time = sv.time;
 		pr_global_struct->self = EDICT_TO_PROG(sv_player);
 		PR_GamePutClientInServer(sv_client->spectator);
+
+		if (sv_player->v->fixangle)
+		{
+			/*
+			 * The normal datagram fixangle path is unreliable. Send spawn
+			 * angles reliably too, so losing the first gameplay packet cannot
+			 * leave the client facing a stale/default direction.
+			 */
+			ClientReliableWrite_Begin(sv_client, svc_setangle, 6);
+#ifdef MVD_PEXT1_HIGHLAGTELEPORT
+			if (sv_client->mvdprotocolextensions1 & MVD_PEXT1_HIGHLAGTELEPORT) {
+				ClientReliableWrite_Byte(sv_client, 2); // respawn
+				sv_client->lastteleport_teleport = 0;
+				sv_client->lastteleport_outgoingseq = sv_client->netchan.outgoing_sequence;
+				sv_client->lastteleport_incomingseq = sv_client->netchan.incoming_sequence;
+				sv_client->lastteleport_teleportyaw = sv_player->v->angles[YAW] - sv_client->lastcmd.angles[YAW];
+			}
+#endif
+			for (i = 0; i < 3; i++) {
+				ClientReliableWrite_Angle(sv_client, sv_player->v->angles[i]);
+			}
+			sv_player->v->fixangle = 0;
+		}
 	}
 
 	// clear the net statistics, because connecting gives a bogus picture
@@ -3119,11 +3159,27 @@ void SV_Voice_UnmuteAll_f(void)
 void SV_EnableClientsCSQC(void)
 {
 	sv_client->csqcactive = true;
+	sv_client->ezcsqc_ready = false;
 }
 
 void SV_DisableClientsCSQC(void)
 {
 	sv_client->csqcactive = false;
+	sv_client->ezcsqc_ready = false;
+}
+
+void SV_EZCSQCReady_f(void)
+{
+	if (sv_client->csqcactive
+#ifdef MVD_PEXT1_EZCSQC
+		&& (sv_client->mvdprotocolextensions1 & MVD_PEXT1_EZCSQC)
+#endif
+	) {
+		if (!sv_client->ezcsqc_ready) {
+			SV_ClientPrintf(sv_client, 2, "\nEZCSQC Antilag ready\n");
+		}
+		sv_client->ezcsqc_ready = true;
+	}
 }
 #endif
 
@@ -3381,6 +3437,7 @@ static ucmd_t ucmds[] =
 #ifdef FTE_PEXT_CSQC
 	{"enablecsqc",	SV_EnableClientsCSQC, false},
 	{"disablecsqc",	SV_DisableClientsCSQC, false},
+	{"ezcsqc_ready", SV_EZCSQCReady_f, false},
 #endif
 
 	{"pext", Cmd_PEXT_f, false}, // user reply with supported protocol extensions.
@@ -3559,6 +3616,26 @@ void SV_PreRunCmd(void)
 	memset(playertouch, 0, sizeof(playertouch));
 }
 
+#ifdef MVD_PEXT1_SIMPLEPROJECTILE
+/*
+===========
+CSQC Stuff, for now just SimpleProjectiles
+===========
+*/
+qbool SV_FrameLost(int framenum, int latest_received_framenum)
+{
+	if (framenum <= sv_client->csqc_framenum)
+	{
+		EntityFrameCSQC_LostFrame(sv_client, framenum, latest_received_framenum);
+		return true;
+	}
+
+	return false;
+}
+
+
+
+#endif
 /*
 ==================
 SV_ApplySafestrafe
@@ -4603,6 +4680,14 @@ void SV_ExecuteClientMessage (client_t *cl)
 
 	seq_hash = cl->netchan.incoming_sequence;
 
+#if defined(MVD_PEXT1_SIMPLEPROJECTILE) || defined(FTE_PEXT_CSQC)
+	for (i = sv_client->csqc_latestverified + 1; i < cl->netchan.incoming_acknowledged; i++)
+	{
+		if (!SV_FrameLost(i, cl->netchan.incoming_acknowledged))
+			break;
+	}
+	sv_client->csqc_latestverified = cl->netchan.incoming_acknowledged;
+#endif
 	// mark time so clients will know how much to predict
 	// other players
 	cl->localtime = sv.time;
@@ -4802,6 +4887,11 @@ void SV_ExecuteClientMessage (client_t *cl)
 #ifdef FTE_PEXT2_VOICECHAT
 		case clc_voicechat:
 			SV_VoiceReadPacket();
+			break;
+#endif
+#ifdef MVD_PEXT1_SIMPLEPROJECTILE
+		case clc_ackframe:
+			MSG_ReadLong();
 			break;
 #endif
 		}

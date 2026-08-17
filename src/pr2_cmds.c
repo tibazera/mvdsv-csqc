@@ -39,12 +39,38 @@
 const char *pr2_ent_data_ptr;
 vm_t *sv_vm = NULL;
 extern gameData_t gamedata;
+extern sizebuf_t *csqcmsgbuffer;
 
 static int PASSFLOAT(float f)
 {
 	floatint_t fi;
 	fi.f = f;
 	return fi.i;
+}
+
+static double SV_CurrentAntilagRewindMsec(client_t *cl)
+{
+	// Mirror sv_antilag 2 target-time selection for KTX-owned antilag 1 traces.
+	client_frame_t *frame = &cl->frames[cl->netchan.incoming_acknowledged & UPDATE_MASK];
+	double target_time, rewind;
+	double max_physfps = sv_maxfps.value;
+
+	// Fall back to the averaged ping before the acknowledged frame has timing.
+	if (frame->ping_time <= 0)
+		return SV_CalcPing(cl);
+
+	// Ignore invalid maxfps values when converting one server frame to seconds.
+	if (max_physfps < 20 || max_physfps > 1000)
+		max_physfps = 77.0;
+
+	// Match MVDSV's prediction allowance, including sv_antilag_no_pred.
+	if (sv_antilag_no_pred.value)
+		target_time = frame->sv_time;
+	else
+		target_time = min(frame->sv_time + (frame->ping_time < 0.02 ? 1 / max_physfps : 0.02), sv.time);
+
+	rewind = sv.time - target_time;
+	return max(rewind, 0) * 1000;
 }
 
 #if 0 // Provided for completness.
@@ -60,6 +86,7 @@ typedef intptr_t (*ext_syscall_t)(intptr_t *arg);
 #ifdef FTE_PEXT_CSQC
 static intptr_t EXT_SetSendNeeded(intptr_t *args);
 #endif
+static intptr_t EXT_SetLastRuntime(intptr_t *args);
 static intptr_t EXT_MapExtFieldPtr(intptr_t *args);
 static intptr_t EXT_SetExtFieldPtr(intptr_t *args);
 static intptr_t EXT_GetExtFieldPtr(intptr_t *args);
@@ -75,6 +102,7 @@ struct
 #ifdef FTE_PEXT_CSQC
 	{"setsendneeded",		EXT_SetSendNeeded},
 #endif
+	{"SetLastRuntime",	EXT_SetLastRuntime},
 };
 ext_syscall_t ext_syscall_tbl[256];
 
@@ -167,7 +195,7 @@ void PR2_CheckEmptyString(char *s)
 		PR2_RunError("Bad string");
 }
 
-void PF2_precache_sound(char *s)
+intptr_t PF2_precache_sound(char *s)
 {
 	int i;
 
@@ -181,16 +209,17 @@ void PF2_precache_sound(char *s)
 		if (!sv.sound_precache[i])
 		{
 			sv.sound_precache[i] = s;
-			return;
+			return i;
 		}
 		if (!strcmp(sv.sound_precache[i], s))
-			return;
+			return i;
 	}
 
 	PR2_RunError ("PF_precache_sound: overflow");
+	return 0;
 }
 
-void PF2_precache_model(char *s)
+intptr_t PF2_precache_model(char *s)
 {
 	int 	i;
 
@@ -205,13 +234,14 @@ void PF2_precache_model(char *s)
 		if (!sv.model_precache[i])
 		{
 			sv.model_precache[i] = s;
-			return;
+			return i;
 		}
 		if (!strcmp(sv.model_precache[i], s))
-			return;
+			return i;
 	}
 
 	PR2_RunError ("PF_precache_model: overflow");
+	return 0;
 }
 
 intptr_t PF2_precache_vwep_model(char *s)
@@ -1182,6 +1212,12 @@ MESSAGE WRITING
 #ifdef FTE_PEXT_CSQC
 #define	MSG_CSQC		5		// for csqc
 #endif
+#define MSG_ONE_NORECORD 6		// reliable to one, excluded from MVD
+
+static qbool PF2_IsReliableOne(int dest)
+{
+	return dest == MSG_ONE || dest == MSG_ONE_NORECORD;
+}
 
 
 sizebuf_t *WriteDest2(int dest)
@@ -1219,9 +1255,7 @@ sizebuf_t *WriteDest2(int dest)
 		return &sv.multicast;
 
 	case MSG_CSQC:
-		// Should return a reference to the CSQC message buffer managed in sv_ents.c
-		PR2_RunError("PF_Write_*: MSG_CSQC not implemented yet.");
-		return NULL;
+		return csqcmsgbuffer;
 
 	default:
 		PR2_RunError ("WriteDest: bad destination");
@@ -1245,12 +1279,12 @@ static client_t *Write_GetClient(void)
 
 void PF2_WriteByte(int to, int data)
 {
-	if (to == MSG_ONE)
+	if (PF2_IsReliableOne(to))
 	{
 		client_t *cl = Write_GetClient();
 		ClientReliableCheckBlock(cl, 1);
 		ClientReliableWrite_Byte(cl, data);
-		if (sv.mvdrecording)
+		if (to == MSG_ONE && sv.mvdrecording)
 		{
 			if (MVDWrite_Begin(dem_single, cl - svs.clients, 1))
 			{
@@ -1264,12 +1298,12 @@ void PF2_WriteByte(int to, int data)
 
 void PF2_WriteChar(int to, int data)
 {
-	if (to == MSG_ONE)
+	if (PF2_IsReliableOne(to))
 	{
 		client_t *cl = Write_GetClient();
 		ClientReliableCheckBlock(cl, 1);
 		ClientReliableWrite_Char(cl, data);
-		if (sv.mvdrecording)
+		if (to == MSG_ONE && sv.mvdrecording)
 		{
 			if (MVDWrite_Begin(dem_single, cl - svs.clients, 1))
 			{
@@ -1283,12 +1317,12 @@ void PF2_WriteChar(int to, int data)
 
 void PF2_WriteShort(int to, int data)
 {
-	if (to == MSG_ONE)
+	if (PF2_IsReliableOne(to))
 	{
 		client_t *cl = Write_GetClient();
 		ClientReliableCheckBlock(cl, 2);
 		ClientReliableWrite_Short(cl, data);
-		if (sv.mvdrecording)
+		if (to == MSG_ONE && sv.mvdrecording)
 		{
 			if (MVDWrite_Begin(dem_single, cl - svs.clients, 2))
 			{
@@ -1302,12 +1336,12 @@ void PF2_WriteShort(int to, int data)
 
 void PF2_WriteLong(int to, int data)
 {
-	if (to == MSG_ONE)
+	if (PF2_IsReliableOne(to))
 	{
 		client_t *cl = Write_GetClient();
 		ClientReliableCheckBlock(cl, 4);
 		ClientReliableWrite_Long(cl, data);
-		if (sv.mvdrecording)
+		if (to == MSG_ONE && sv.mvdrecording)
 		{
 			if (MVDWrite_Begin(dem_single, cl - svs.clients, 4))
 			{
@@ -1321,7 +1355,7 @@ void PF2_WriteLong(int to, int data)
 
 void PF2_WriteAngle(int to, float data)
 {
-	if (to == MSG_ONE)
+	if (PF2_IsReliableOne(to))
 	{
 #ifdef FTE_PEXT_FLOATCOORDS
 		int size = msg_anglesize;
@@ -1331,7 +1365,7 @@ void PF2_WriteAngle(int to, float data)
 		client_t *cl = Write_GetClient();
 		ClientReliableCheckBlock(cl, size);
 		ClientReliableWrite_Angle(cl, data);
-		if (sv.mvdrecording)
+		if (to == MSG_ONE && sv.mvdrecording)
 		{
 			if (MVDWrite_Begin(dem_single, cl - svs.clients, size))
 			{
@@ -1345,7 +1379,7 @@ void PF2_WriteAngle(int to, float data)
 
 void PF2_WriteCoord(int to, float data)
 {
-	if (to == MSG_ONE)
+	if (PF2_IsReliableOne(to))
 	{
 #ifdef FTE_PEXT_FLOATCOORDS
 		int size = msg_coordsize;
@@ -1355,7 +1389,7 @@ void PF2_WriteCoord(int to, float data)
 		client_t *cl = Write_GetClient();
 		ClientReliableCheckBlock(cl, size);
 		ClientReliableWrite_Coord(cl, data);
-		if (sv.mvdrecording)
+		if (to == MSG_ONE && sv.mvdrecording)
 		{
 			if (MVDWrite_Begin(dem_single, cl - svs.clients, size))
 			{
@@ -1369,12 +1403,12 @@ void PF2_WriteCoord(int to, float data)
 
 void PF2_WriteString(int to, char *data)
 {
-	if (to == MSG_ONE)
+	if (PF2_IsReliableOne(to))
 	{
 		client_t *cl = Write_GetClient();
 		ClientReliableCheckBlock(cl, 1 + strlen(data));
 		ClientReliableWrite_String(cl, data);
-		if (sv.mvdrecording)
+		if (to == MSG_ONE && sv.mvdrecording)
 		{
 			if (MVDWrite_Begin(dem_single, cl - svs.clients, 1 + strlen(data)))
 			{
@@ -1388,12 +1422,12 @@ void PF2_WriteString(int to, char *data)
 
 void PF2_WriteEntity(int to, int data)
 {
-	if (to == MSG_ONE)
+	if (PF2_IsReliableOne(to))
 	{
 		client_t *cl = Write_GetClient();
 		ClientReliableCheckBlock(cl, 2);
 		ClientReliableWrite_Short(cl,data );//G_EDICTNUM(OFS_PARM1)
-		if (sv.mvdrecording)
+		if (to == MSG_ONE && sv.mvdrecording)
 		{
 			if (MVDWrite_Begin(dem_single, cl - svs.clients, 2))
 			{
@@ -1574,7 +1608,7 @@ void PF2_infokey(int e1, char *key, char *valbuff, int sizebuff)
 
 			if (   !strcmp(key, "date_str")
 				|| !strcmp(key, "ip") || !strncmp(key, "realip", 7) || !strncmp(key, "download", 9)
-				|| !strcmp(key, "ping") || !strcmp(key, "*userid") || !strncmp(key, "login", 6)
+				|| !strcmp(key, "ping") || !strcmp(key, "ping_current") || !strcmp(key, "antilag_rewind") || !strcmp(key, "*userid") || !strncmp(key, "login", 6)
 				|| !strcmp(key, "*VIP") || !strcmp(key, "*state")
 				|| !strcmp(key, "netname")
 				|| !strcmp(key, "mapname") || !strcmp(key, "modelname")
@@ -1613,12 +1647,30 @@ void PF2_infokey(int e1, char *key, char *valbuff, int sizebuff)
 			strlcpy(ov, NET_BaseAdrToString (cl->realip), sizeof(ov));
 		else if (!strncmp(key, "download", 9))
 			snprintf(ov, sizeof(ov), "%d", cl->file_percent ? cl->file_percent : -1); //bliP: file percent
+		else if (!strcmp(key, "ping_current"))
+		{
+			client_frame_t *frame = &cl->frames[cl->netchan.incoming_acknowledged & UPDATE_MASK];
+			if (frame->ping_time > 0)
+				snprintf(ov, sizeof(ov), "%.6f", frame->ping_time * 1000);
+			else
+				snprintf(ov, sizeof(ov), "%d", (int)SV_CalcPing(cl));
+		}
+		else if (!strcmp(key, "antilag_rewind"))
+			snprintf(ov, sizeof(ov), "%.6f", SV_CurrentAntilagRewindMsec(cl));
 		else if (!strcmp(key, "ping"))
 			snprintf(ov, sizeof(ov), "%d", (int)SV_CalcPing(cl));
 #ifdef FTE_PEXT_CSQC
-		else if (!strcmp(key, "csqcactive") || !strcmp(key, "*csqcactive") || !strcmp(key, "ezcsqc"))
+		else if (!strcmp(key, "csqcactive") || !strcmp(key, "*csqcactive"))
 		{
 			snprintf(ov, sizeof(ov), "%d", (int)cl->csqcactive);
+		}
+		else if (!strcmp(key, "ezcsqc"))
+		{
+			snprintf(ov, sizeof(ov), "%d", (int)SV_ClientSupportsEZCSQC(cl));
+		}
+		else if (!strcmp(key, "ezcsqc_ready"))
+		{
+			snprintf(ov, sizeof(ov), "%d", (int)cl->ezcsqc_ready);
 		}
 #endif
 		else if (!strcmp(key, "*userid"))
@@ -1935,7 +1987,7 @@ intptr_t PF2_FS_GetFileList(char *path, char *ext,
 		snprintf (netpath, sizeof (netpath), "%s/%s", gpath, path);
 
 		// reg exp search...
-		dir = Sys_listdir(netpath, ext, SORT_NO);
+		dir = Sys_listdir_no_metadata(netpath, ext);
 
 		for (j = 0; i < list_cnt && dir.files[j].name[0]; j++, i++)
 		{
@@ -2003,10 +2055,52 @@ intptr_t PF2_FS_GetFileList(char *path, char *ext,
 #ifdef FTE_PEXT_CSQC
 intptr_t EXT_SetSendNeeded(intptr_t *args)
 {
-	PR2_RunError("SetSendNeeded not implemented yet.");
+	unsigned int subject = args[1];
+	int fl = args[2];
+	unsigned int to = args[3];
+
+	if (!subject || subject >= MAX_EDICTS || !fl)
+		return 0;
+
+	if (!to)
+	{	//broadcast
+		for (to = 0; to < MAX_CLIENTS; to++)
+		{
+			if (svs.clients[to].state < cs_connected || !SV_ClientSupportsEZCSQC(&svs.clients[to]))
+				continue;
+
+			svs.clients[to].csqcentitysendflags[subject] |= fl;
+			svs.clients[to].csqcentityscope[subject] |= SCOPE_WANTUPDATE;
+		}
+	}
+
+	else
+	{
+		to--;
+		if (to >= MAX_CLIENTS)
+			;	//some kind of error.
+		else if (SV_ClientSupportsEZCSQC(&svs.clients[to]))
+		{
+			svs.clients[to].csqcentitysendflags[subject] |= fl;
+			svs.clients[to].csqcentityscope[subject] |= SCOPE_WANTUPDATE;
+		}
+	}
 	return 0;
 }
 #endif
+
+static intptr_t EXT_SetLastRuntime(intptr_t *args)
+{
+	int entnum = (int)args[1];
+	edict_t *ent;
+
+	if (entnum <= 0 || entnum >= sv.num_edicts)
+		return 0;
+
+	ent = EDICT_NUM(entnum);
+	ent->e.lastruntime = sv.time;
+	return 0;
+}
 
 // To prevent mods from hardcoding field offsets which would cause engine incompatibilities.
 static uint32_t GetExtFieldCookie(void)
@@ -2581,11 +2675,9 @@ intptr_t PR2_GameSystemCalls(intptr_t *args) {
 		ED_Free(VME(1));
 		return 0;
 	case G_PRECACHE_SOUND:
-		PF2_precache_sound(VMA(1));
-		return 0;
+		return PF2_precache_sound(VMA(1));
 	case G_PRECACHE_MODEL:
-		PF2_precache_model(VMA(1));
-		return 0;
+		return PF2_precache_model(VMA(1));
 	case G_LIGHTSTYLE:
 		PF2_lightstyle(args[1], VMA(2));
 		return 0;

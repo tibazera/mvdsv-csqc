@@ -550,6 +550,7 @@ static void SV_WritePlayersToClient (client_t *client, client_frame_t *frame, by
 	usercmd_t cmd;
 	int hideent = 0;
 	int trackent = 0;
+	int spec_track_override = 0;
 	qbool hide_players = fofs_hide_players && ((eval_t *)((byte *)(client->edict)->v + fofs_hide_players))->_int;
 
 	if (fofs_hideentity)
@@ -561,6 +562,9 @@ static void SV_WritePlayersToClient (client_t *client, client_frame_t *frame, by
 		if (trackent < 1 || trackent > MAX_CLIENTS || svs.clients[trackent - 1].state != cs_spawned)
 			trackent = 0;
 	}
+
+	if (client->spectator && trackent > 0 && client->spec_track > 0)
+		spec_track_override = trackent;
 
 	frame->sv_time = sv.time;
 
@@ -582,7 +586,7 @@ static void SV_WritePlayersToClient (client_t *client, client_frame_t *frame, by
 		if (client != cl && hide_players)
 			continue;
 
-		if (trackent && cl == client)
+		if (trackent && cl == client && !client->spectator)
 		{
 			cl = &svs.clients[trackent - 1]; // fakenicking.
 
@@ -594,6 +598,12 @@ static void SV_WritePlayersToClient (client_t *client, client_frame_t *frame, by
 		else
 		{
 			self_ent = client->edict;
+			ent = cl->edict;
+		}
+
+		if (spec_track_override && j == client->spec_track - 1)
+		{
+			cl = &svs.clients[spec_track_override - 1];
 			ent = cl->edict;
 		}
 
@@ -610,7 +620,10 @@ static void SV_WritePlayersToClient (client_t *client, client_frame_t *frame, by
 			continue;
 
 		if (j == trackent - 1)
-			continue;
+		{
+			if (!(spec_track_override && client->spec_track == trackent))
+				continue;
+		}
 
 		if (disable_updates && ent != self_ent)
 		{ // Vladis
@@ -793,7 +806,9 @@ static void SV_WritePlayersToClient (client_t *client, client_frame_t *frame, by
 			MSG_WriteByte (msg, TranslateEffects(ent));
 
 		if (pflags & PF_WEAPONFRAME)
-			MSG_WriteByte (msg, ent->v->weaponframe);
+		{
+			MSG_WriteByte(msg, ent->v->weaponframe);
+		}
 
 #ifdef FTE_PEXT_TRANS
 		if (pflags & PF_TRANS_Z)
@@ -820,6 +835,10 @@ qbool SV_EntityVisibleToClient (client_t* client, int e, byte* pvs)
 			return false;
 	}
 
+	// if pvsflags are set to ignore all
+	if (((int)ent->xv.pvsflags & PVSF_IGNOREPVS) == PVSF_IGNOREPVS)
+		return true;
+
 	// ignore ents without visible models
 	if (!ent->v->modelindex || !*PR_GetEntityString(ent->v->model))
 		return false;
@@ -839,6 +858,385 @@ qbool SV_EntityVisibleToClient (client_t* client, int e, byte* pvs)
 
 	return true;
 }
+
+#if defined(MVD_PEXT1_SIMPLEPROJECTILE) || defined(FTE_PEXT_CSQC)
+static int EntityFrameCSQC_AllocFrame(client_t *client, int framenum)
+{
+	int ringfirst = client->csqcentityframehistory_next; // oldest entry
+	client->csqcentityframehistory_next += 1;
+	client->csqcentityframehistory_next %= NUM_CSQCENTITYDB_FRAMES;
+	client->csqcentityframehistory[ringfirst].framenum = framenum;
+	client->csqcentityframehistory[ringfirst].num = 0;
+	return ringfirst;
+}
+
+static void EntityFrameCSQC_DeallocFrame(client_t *client, int framenum)
+{
+	int ringfirst = client->csqcentityframehistory_next; // oldest entry
+	int ringlast = (ringfirst + NUM_CSQCENTITYDB_FRAMES - 1) % NUM_CSQCENTITYDB_FRAMES; // most recently added entry
+	if (framenum == client->csqcentityframehistory[ringlast].framenum)
+	{
+		client->csqcentityframehistory[ringlast].framenum = -1;
+		client->csqcentityframehistory[ringlast].num = 0;
+		client->csqcentityframehistory_next = ringlast;
+	}
+	else
+		Con_Printf("Trying to dealloc the wrong entity frame\n");
+}
+#endif
+
+#ifdef FTE_PEXT_CSQC
+sizebuf_t *csqcmsgbuffer;
+int SV_SimpleProjectileWriteFrame_CSQC(client_t *client, struct sizebuf_s *msg, int maxsize, int entlist_size, const unsigned short *entlist)
+{
+	int num, number, end, sendflags;
+	const unsigned short *entnum;
+	edict_t *ed;
+
+	/*
+	 * Native svc_fte_csqcentities has no on-wire frame number. Store history
+	 * under the outgoing server packet sequence because clients ack that value
+	 * back through netchan.incoming_acknowledged.
+	 */
+	client->csqc_framenum = client->netchan.outgoing_sequence;
+	int dbframe = EntityFrameCSQC_AllocFrame(client, client->csqc_framenum);
+	csqcentityframedb_t *db = &client->csqcentityframehistory[dbframe];
+	if (client->csqcentityframe_lastreset < 0)
+		client->csqcentityframe_lastreset = client->csqc_framenum;
+
+	csqcmsgbuffer = msg;
+	int sectionstarted = false;
+
+	maxsize -= 24;
+
+
+	if (msg->cursize + 32 >= maxsize)
+		return false;
+
+	// blind check to make sure we can't miss any potential csqc ents
+	if (client->csqcnumedicts < sv.num_edicts)
+		client->csqcnumedicts = sv.num_edicts;
+
+	number = 1;
+	for (num = 0, entnum = entlist; num < entlist_size; num++, entnum++)
+	{
+		// cleanup old ents
+		end = *entnum;
+		for (; number < end; number++)
+		{
+			ed = EDICT_NUM(number);
+			/*
+			 * SetSendNeeded() and enablecsqc can schedule CSQC setup or
+			 * owner-only SendEntity updates independently of the current PVS
+			 * list. Do not erase those pending updates just because the entity
+			 * is absent from this frame's visibility walk.
+			 */
+			if (ed->xv.sendentity && (client->csqcentityscope[number] & SCOPE_WANTUPDATE))
+				continue;
+
+			client->csqcentityscope[number] &= ~SCOPE_WANTSEND;
+			if (client->csqcentityscope[number] & SCOPE_ASSUMED_EXISTING)
+				client->csqcentityscope[number] |= SCOPE_WANTREMOVE;
+			client->csqcentitysendflags[number] = 0xFFFFFF;
+		}
+
+		ed = EDICT_NUM(number);//sv.edicts + number;
+		client->csqcentityscope[number] &= ~SCOPE_WANTSEND;
+		if (ed->xv.sendentity)
+		{
+			client->csqcentityscope[number] |= SCOPE_WANTUPDATE;
+		}
+		else
+		{
+			if (client->csqcentityscope[number] & SCOPE_ASSUMED_EXISTING)
+				client->csqcentityscope[number] |= SCOPE_WANTREMOVE;
+			client->csqcentitysendflags[number] = 0xFFFFFF;
+		}
+		number++;
+	}
+	end = client->csqcnumedicts;
+	for (; number < end; number++)
+	{
+		ed = EDICT_NUM(number);
+		/* Preserve explicitly scheduled SendEntity updates outside PVS. */
+		if (ed->xv.sendentity && (client->csqcentityscope[number] & SCOPE_WANTUPDATE))
+			continue;
+
+		client->csqcentityscope[number] &= ~SCOPE_WANTSEND;
+		if (client->csqcentityscope[number] & SCOPE_ASSUMED_EXISTING)
+			client->csqcentityscope[number] |= SCOPE_WANTREMOVE;
+		client->csqcentitysendflags[number] = 0xFFFFFF;
+	}
+
+
+	end = client->csqcnumedicts;
+
+	for (number = 1; number < end; number++)
+	{
+		if (!(client->csqcentityscope[number] & SCOPE_WANTSEND))
+			continue;
+
+		if (db->num >= NUM_CSQCENTITIES_PER_FRAME)
+			break;
+		ed = EDICT_NUM(number);//sv.edicts + number;
+		if (client->csqcentityscope[number] & SCOPE_WANTREMOVE)  // Also implies ASSUMED_EXISTING.
+		{
+			//Con_Printf("csqc ent removal\n");
+
+			// A removal. SendFlags have no power here.
+			// write a remove message
+			// first write the message identifier if needed
+			if (!sectionstarted)
+			{
+				sectionstarted = 1;
+				MSG_WriteByte(msg, svc_fte_csqcentities);
+				//MSG_WriteLong(msg, client->csqc_framenum);
+			}
+			// write the remove message
+			{
+				MSG_WriteShort(msg, (unsigned short)number | 0x8000);
+				client->csqcentityscope[number] &= ~(SCOPE_WANTSEND | SCOPE_ASSUMED_EXISTING);
+				client->csqcentitysendflags[number] = 0xFFFFFF; // resend completely if it becomes active again
+				db->entno[db->num] = number;
+				db->sendflags[db->num] = -1;
+				db->num += 1;
+			}
+			if (msg->cursize + 17 >= maxsize)
+				break;
+		}
+		else
+		{
+			byte entbuf[MAX_MSGLEN];
+			sizebuf_t entmsg;
+			sizebuf_t *oldcsqcmsgbuffer;
+			int bytes_needed;
+
+			// An update.
+			sendflags = client->csqcentitysendflags[number];
+			// Nothing to send? FINE.
+			if (!sendflags)
+				continue;
+
+			// If it's a new entity, always assume sendflags 0xFFFFFF.
+			if (!(client->csqcentityscope[number] & SCOPE_ASSUMED_EXISTING))
+				sendflags = 0xFFFFFF;
+
+			/*
+			 * Write the QC callback payload to a temporary buffer first.
+			 * SZ_GetSpace() clears an allowoverflow buffer when it overflows;
+			 * doing that directly to the packet can turn the next top-level
+			 * byte into 0 and disconnect the client with an illegible message.
+			 */
+			SZ_InitEx(&entmsg, entbuf, sizeof(entbuf), true);
+			oldcsqcmsgbuffer = csqcmsgbuffer;
+			csqcmsgbuffer = &entmsg;
+			if (!PR2_SendEntity(ed, client->edict, sendflags))
+			{
+				csqcmsgbuffer = oldcsqcmsgbuffer;
+				client->csqcentitysendflags[number] = 0;
+				continue;
+			}
+			csqcmsgbuffer = oldcsqcmsgbuffer;
+
+			if (!entmsg.cursize)
+			{
+				Con_Printf("CSQC SendEntity wrote empty payload for ent %d\n", number);
+				client->csqcentitysendflags[number] = 0;
+				continue;
+			}
+
+			if (entmsg.overflowed)
+			{
+				Con_Printf("CSQC SendEntity payload overflowed for ent %d\n", number);
+				break;
+			}
+
+			bytes_needed = (sectionstarted ? 0 : 1) + 2 + entmsg.cursize + 2;
+			if (msg->cursize + bytes_needed > maxsize)
+			{
+				/*
+				 * The update is too big for this packet. Leave it queued and
+				 * retry next frame so smaller later entities cannot overtake it.
+				 */
+				break;
+			}
+
+			if (!sectionstarted)
+			{
+				MSG_WriteByte(msg, svc_fte_csqcentities);
+				//MSG_WriteLong(msg, client->csqc_framenum);
+				sectionstarted = 1;
+			}
+
+			MSG_WriteShort(msg, (unsigned short)number);
+			SZ_Write(msg, entmsg.data, entmsg.cursize);
+
+			// an update has been successfully written
+			client->csqcentitysendflags[number] = 0;
+			//db->entno[db->num] = number;
+			//db->sendflags[db->num] = sendflags;
+			//db->num += 1;
+			client->csqcentityscope[number] &= ~SCOPE_WANTSEND;
+			client->csqcentityscope[number] |= SCOPE_EXISTED_ONCE | SCOPE_ASSUMED_EXISTING;
+			db->entno[db->num] = number;
+			db->sendflags[db->num] = sendflags;
+			db->num += 1;
+
+			if (msg->cursize + 17 >= maxsize)
+				break;
+			continue;
+		}
+	}
+
+
+	if (sectionstarted)
+	{
+		// write index 0 to end the update (0 is never used by real entities)
+		MSG_WriteShort(msg, 0);
+	}
+
+
+	if (db->num == 0)
+		EntityFrameCSQC_DeallocFrame(client, client->csqc_framenum);
+
+	return sectionstarted;
+}
+
+int SV_PrepareEntity_CSQC(edict_t *ent, entity_state_t *cs, int enumber)
+{
+	if (ent->xv.sendentity == 0)
+		return false;
+
+	//for (i = 0; i < MAX_CLIENTS; i++)
+	//	svs.clients[i].csqcentitysendflags[enumber] |= 65535;//(int)ent->xv->SendFlags;
+
+	return true;
+}
+#endif
+
+
+#if defined(MVD_PEXT1_SIMPLEPROJECTILE) || defined(FTE_PEXT_CSQC)
+void EntityFrameCSQC_LostFrame(client_t *client, int framenum, int latest_received_framenum)
+{
+	// marks a frame as lost
+	int i, j;
+	qbool valid;
+	int ringfirst, ringlast;
+	static int recoversendflags[MAX_EDICTS]; // client only
+	csqcentityframedb_t *d;
+
+	if (client->csqcentityframe_lastreset < 0)
+		return;
+	if (framenum < client->csqcentityframe_lastreset)
+		return; // no action required, as we resent that data anyway
+
+	// is our frame out of history?
+	ringfirst = client->csqcentityframehistory_next; // oldest entry
+	ringlast = (ringfirst + NUM_CSQCENTITYDB_FRAMES - 1) % NUM_CSQCENTITYDB_FRAMES; // most recently added entry
+
+	valid = false;
+
+	for (j = 0; j < NUM_CSQCENTITYDB_FRAMES; ++j)
+	{
+		d = &client->csqcentityframehistory[(ringfirst + j) % NUM_CSQCENTITYDB_FRAMES];
+		if (d->framenum < 0)
+			continue;
+		if (d->framenum == framenum)
+			break;
+		else if (d->framenum < framenum)
+			valid = true;
+	}
+	if (j == NUM_CSQCENTITYDB_FRAMES)
+	{
+		if (valid) // got beaten, i.e. there is a frame < framenum
+		{
+			// a non-csqc frame got lost... great
+			return;
+		}
+		else
+		{
+			// a too old frame got lost... sorry, cannot handle this
+			Con_DPrintf("CSQC entity DB: lost a frame too early to do any handling (resending ALL)...\n");
+			Con_DPrintf("Lost frame = %d\n", framenum);
+			Con_DPrintf("Entity DB = %d to %d\n", client->csqcentityframehistory[ringfirst].framenum, client->csqcentityframehistory[ringlast].framenum);
+			//EntityFrameCSQC_LostAllFrames(client);
+			client->csqcentityframe_lastreset = -1;
+		}
+		return;
+	}
+
+	// so j is the frame that got lost
+	// ringlast is the frame that we have to go to
+	ringfirst = (ringfirst + j) % NUM_CSQCENTITYDB_FRAMES;
+	if (ringlast < ringfirst)
+		ringlast += NUM_CSQCENTITYDB_FRAMES;
+
+	memset(recoversendflags, 0, sizeof(recoversendflags));
+
+	for (j = ringfirst; j <= ringlast; ++j)
+	{
+		d = &client->csqcentityframehistory[j % NUM_CSQCENTITYDB_FRAMES];
+		if (d->framenum < 0)
+		{
+			// deleted frame
+		}
+		else if (d->framenum > latest_received_framenum)
+		{
+			/*
+			 * Only suppress resend bits using frames the client has actually
+			 * acknowledged. Later unacked frames may be lost too, which is
+			 * exactly what happens to startup weapondefs under artificial lag.
+			 */
+			continue;
+		}
+		else if (d->framenum < framenum)
+		{
+			// a frame in the past... should never happen
+			Con_Printf("CSQC entity DB encountered a frame from the past when recovering from PL...?\n");
+		}
+		else if (d->framenum == framenum)
+		{
+			// handling the actually lost frame now
+			for (i = 0; i < d->num; ++i)
+			{
+				int sf = d->sendflags[i];
+				int ent = d->entno[i];
+				if (sf < 0) // remove
+					recoversendflags[ent] |= -1; // all bits, including sign
+				else if (sf > 0)
+					recoversendflags[ent] |= sf;
+			}
+		}
+		else
+		{
+			// handling the frames that followed it now
+			for (i = 0; i < d->num; ++i)
+			{
+				int sf = d->sendflags[i];
+				int ent = d->entno[i];
+				if (sf < 0) // remove
+				{
+					recoversendflags[ent] = 0; // no need to update, we got a more recent remove (and will fix it THEN)
+					break; // no flags left to remove...
+				}
+				else if (sf > 0)
+					recoversendflags[ent] &= ~sf; // no need to update these bits, we already got them later
+			}
+		}
+	}
+
+	for (i = 0; i < client->csqcnumedicts; ++i)
+	{
+		if (recoversendflags[i] < 0)
+			client->csqcentityscope[i] |= SCOPE_ASSUMED_EXISTING | SCOPE_WANTREMOVE;  // FORCE REMOVE.
+		else if (recoversendflags[i] > 0)
+		{
+			client->csqcentitysendflags[i] |= recoversendflags[i];
+			client->csqcentityscope[i] |= SCOPE_WANTUPDATE;
+		}
+	}
+}
+#endif
 
 /*
 =============
@@ -863,6 +1261,7 @@ void SV_WriteEntitiesToClient (client_t *client, sizebuf_t *msg, qbool recorder)
 	int hideent;
 	unsigned int client_flag = (1 << (client - svs.clients));
 	edict_t	*clent = client->edict;
+	int numcsqcsendstates;
 
 	float distances[MAX_PACKETENTITIES_POSSIBLE] = { 0 };
 	float distance;
@@ -941,6 +1340,9 @@ void SV_WriteEntitiesToClient (client_t *client, sizebuf_t *msg, qbool recorder)
 	// put other visible entities into either a packet_entities or a nails message
 	pack = &frame->entities;
 	pack->num_entities = 0;
+	#ifdef MVD_PEXT1_SIMPLEPROJECTILE
+	numcsqcsendstates = 0;
+	#endif
 
 	numnails = 0;
 
@@ -968,6 +1370,17 @@ void SV_WriteEntitiesToClient (client_t *client, sizebuf_t *msg, qbool recorder)
 			if (e == hideent) {
 				continue;
 			}
+
+		#ifdef FTE_PEXT_CSQC
+			if (SV_ClientSupportsEZCSQC(client) && !recorder)
+			{
+				if (SV_PrepareEntity_CSQC(ent, state, e))
+				{
+					sv.csqcsendstates[numcsqcsendstates++] = e;
+					continue;
+				}
+			}
+		#endif
 
 			if (SV_AddNailUpdate (ent))
 				continue; // added to the special update list
@@ -1044,6 +1457,13 @@ void SV_WriteEntitiesToClient (client_t *client, sizebuf_t *msg, qbool recorder)
 	// last packetentities acknowledged by the client
 
 	SV_EmitPacketEntities (client, pack, msg);
+
+#ifdef FTE_PEXT_CSQC
+	if (SV_ClientSupportsEZCSQC(client) && !recorder)
+	{
+		SV_SimpleProjectileWriteFrame_CSQC(client, msg, msg->maxsize, numcsqcsendstates, sv.csqcsendstates);
+	}
+#endif
 
 	// now add the specialized nail update
 	SV_EmitNailUpdate (msg, recorder);

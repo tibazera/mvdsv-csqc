@@ -36,6 +36,28 @@ char	localmodels[MAX_MODELS][5];	// inline model names for precache
 //char localinfo[MAX_LOCALINFO_STRING+1]; // local game info
 ctxinfo_t _localinfo_;
 
+#if defined(MVD_PEXT1_SIMPLEPROJECTILE) || defined(FTE_PEXT_CSQC)
+static void SV_ResetClientCSQCEntityState(client_t *client)
+{
+	int i;
+
+	// This state is client-local, so it survives the sv struct reset unless cleared here.
+	client->csqc_framenum = 0;
+	client->csqc_latestverified = client->netchan.incoming_acknowledged;
+	client->csqcnumedicts = 0;
+	memset(client->csqcentityscope, 0, sizeof(client->csqcentityscope));
+	memset(client->csqcentitysendflags, 0, sizeof(client->csqcentitysendflags));
+	client->csqcentityframehistory_next = 0;
+	client->csqcentityframe_lastreset = -1;
+
+	// Mark every saved frame empty so loss recovery cannot replay old-map entities.
+	for (i = 0; i < NUM_CSQCENTITYDB_FRAMES; i++) {
+		client->csqcentityframehistory[i].framenum = -1;
+		client->csqcentityframehistory[i].num = 0;
+	}
+}
+#endif
+
 int fofs_items2;
 int fofs_maxspeed, fofs_gravity;
 int fofs_movement;
@@ -460,6 +482,28 @@ void SV_SpawnServer(char *mapname, qbool devmap, char* entityfile, qbool loading
 		}
 	}
 #endif
+#ifdef MVD_PEXT1_WEAPONPREDICTION
+	// Legacy client weapon prediction was removed; keep the extension unavailable.
+	svs.mvdprotocolextension1 &= ~MVD_PEXT1_WEAPONPREDICTION;
+#endif
+#ifdef MVD_PEXT1_SIMPLEPROJECTILE
+	// Legacy simple projectiles were replaced by the EZCSQC projectile stream.
+	svs.mvdprotocolextension1 &= ~MVD_PEXT1_SIMPLEPROJECTILE;
+#endif
+#if defined(FTE_PEXT_CSQC) && defined(MVD_PEXT1_EZCSQC)
+	// EZCSQC is an MVD payload contract carried over the broader FTE CSQC transport.
+	if (Q_atof(Cvar_String("qwm_ezcsqc")) > 0) {
+		svs.mvdprotocolextension1 |= MVD_PEXT1_EZCSQC;
+		Info_SetValueForKey(svs.info, "ezcsqc", "1", MAX_SERVERINFO_STRING);
+	}
+	else {
+		svs.mvdprotocolextension1 &= ~MVD_PEXT1_EZCSQC;
+		Info_SetValueForKey(svs.info, "ezcsqc", "", MAX_SERVERINFO_STRING);
+	}
+#endif
+#ifdef FTE_PEXT_CSQC
+	svs.fteprotocolextensions |= FTE_PEXT_CSQC;
+#endif
 
 	// find optional QC-exported functions.
 	// we have it here, so we set it to NULL in case of PR2 progs.
@@ -484,6 +528,10 @@ void SV_SpawnServer(char *mapname, qbool devmap, char* entityfile, qbool loading
 		PR_SetEntityString(ent, ent->v->netname, svs.clients[i].name);
 		// reserve edict.
 		svs.clients[i].edict = ent;
+#if defined(MVD_PEXT1_SIMPLEPROJECTILE) || defined(FTE_PEXT_CSQC)
+		// New edict world: discard CSQC/simple-projectile history from the previous map.
+		SV_ResetClientCSQCEntityState(&svs.clients[i]);
+#endif
 		//ZOID - make sure we update frags right
 		svs.clients[i].old_frags = 0;
 	}
